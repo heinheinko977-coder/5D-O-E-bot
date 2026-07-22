@@ -1,0 +1,488 @@
+import os
+import time
+import requests
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# ============================================
+#  RAILWAY VARIABLES
+# ============================================
+TOKEN = os.environ.get("BOT_TOKEN")
+PHONE = os.environ.get("CK_PHONE")
+PASSWORD = os.environ.get("CK_PASSWORD")
+
+# ============================================
+#  AUTHORIZED USERS (ခင်ဗျားရဲ့ Telegram ID ထည့်ပါ)
+# ============================================
+AUTHORIZED_USERS = [
+    8261689655,  # ← ဒီနေရာမှာ ခင်ဗျားရဲ့ ID ထည့်ပါ
+]
+
+# ============================================
+#  DEFAULT 5D BET SEQUENCE (၇ ကြိမ်)
+# ============================================
+DEFAULT_5D_SEQUENCE = [100, 300, 900, 2400, 7200, 15000, 30000]
+
+# ============================================
+#  GAME SETTINGS
+# ============================================
+game_settings = {
+    "5d": {
+        "enabled": True,
+        "game_type": "5D1minute",
+        "bet_type": "even",  # even, odd, big, small
+        "follow": True,  # True = ကျတာကိုလိုက်ထိုး
+        "sequence": DEFAULT_5D_SEQUENCE.copy()
+    }
+}
+
+# ============================================
+#  CKLOTTERY API
+# ============================================
+LOGIN_URL = "http://www.cklottery.org/api/login"
+BET_URL = "http://www.cklottery.org/api/bet"
+BALANCE_URL = "http://www.cklottery.org/api/balance"
+RESULT_URL = "http://www.cklottery.org/api/result"
+
+# ============================================
+#  GLOBAL VARIABLES
+# ============================================
+session = requests.Session()
+is_running = False
+is_paused = False
+total_win = 0
+total_loss = 0
+consecutive_losses = 0
+chat_id = None
+is_logged_in = False
+last_result = None
+
+# ============================================
+#  AUTH CHECK
+# ============================================
+def is_authorized(user_id):
+    return user_id in AUTHORIZED_USERS
+
+# ============================================
+#  CKLOTTERY FUNCTIONS
+# ============================================
+
+def login():
+    global is_logged_in
+    try:
+        login_data = {"phone": PHONE, "password": PASSWORD}
+        response = session.post(LOGIN_URL, data=login_data, timeout=10)
+        if response.status_code == 200:
+            is_logged_in = True
+            return True
+        is_logged_in = False
+        return False
+    except:
+        is_logged_in = False
+        return False
+
+def get_balance():
+    try:
+        response = session.get(BALANCE_URL, timeout=10)
+        if response.status_code == 200:
+            return response.json().get("balance", 0)
+        return 0
+    except:
+        return 0
+
+def get_last_result():
+    """နောက်ဆုံးပွဲရလဒ်ကိုယူမယ်"""
+    try:
+        response = session.get(RESULT_URL, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("number", None)
+        return None
+    except:
+        return None
+
+def get_bet_type_from_number(number):
+    """ဂဏန်းကိုကြည့်ပြီး Even/Odd ဆုံးဖြတ်မယ်"""
+    if number is None:
+        return None
+    number = int(number)
+    if number % 2 == 0:
+        return "even"
+    else:
+        return "odd"
+
+def place_bet(game_type, bet_type, amount):
+    try:
+        bet_data = {
+            "game": game_type,
+            "type": bet_type,
+            "amount": amount
+        }
+        response = session.post(BET_URL, data=bet_data, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        return {"status": "error"}
+    except:
+        return {"status": "error"}
+
+# ============================================
+#  TELEGRAM COMMANDS
+# ============================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ ခွင့်မပြုပါ!")
+        return
+    
+    global chat_id
+    chat_id = update.effective_chat.id
+    
+    keyboard = [
+        [InlineKeyboardButton("🔑 Login", callback_data="login")],
+        [InlineKeyboardButton("💰 လက်ကျန်", callback_data="balance")],
+        [InlineKeyboardButton("⚙️ 5D သတ်မှတ်ချက်များ", callback_data="set_5d")],
+        [InlineKeyboardButton("▶️ စတင်ဆော့ (5D)", callback_data="start_5d")],
+        [InlineKeyboardButton("⏸ ခဏရပ်", callback_data="pause")],
+        [InlineKeyboardButton("⏹ ရပ်ဆိုင်း", callback_data="stop")],
+        [InlineKeyboardButton("📊 အခြေအနေ", callback_data="status")],
+        [InlineKeyboardButton("📈 လိုက်ဆပြောင်းရန်", callback_data="change_sequence")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    seq = game_settings["5d"]["sequence"]
+    await update.message.reply_text(
+        f"🤖 **5D Auto Bot (လိုက်ထိုးစနစ်)**\n\n"
+        f"📌 **စနစ်အလုပ်လုပ်ပုံ**\n"
+        f"✅ ကျတဲ့ဂဏန်းကို လိုက်ထိုးမယ် (Even→Even, Odd→Odd)\n"
+        f"✅ ရှုံးရင် ဆတင်းလိုက်မယ်\n"
+        f"✅ အိုင်ရင် / လိုက်ဆကုန်ရင် ပထမဆုံးကနေ ပြန်စမယ်\n\n"
+        f"📌 **လက်ရှိလိုက်ဆ**\n"
+        f"`{seq}`\n\n"
+        f"အောက်ပါခလုတ်များနဲ့ ထိန်းချုပ်ပါ 👇",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global chat_id, is_running, is_paused, total_win, total_loss, consecutive_losses, is_logged_in, last_result
+    
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await query.edit_message_text("⛔ ခွင့်မပြုပါ!")
+        return
+    
+    chat_id = update.effective_chat.id
+    
+    # ========== LOGIN ==========
+    if query.data == "login":
+        if login():
+            await query.edit_message_text("✅ **Login အောင်မြင်ပါပြီ!**", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("❌ **Login မအောင်မြင်ပါ!**", parse_mode="Markdown")
+    
+    # ========== BALANCE ==========
+    elif query.data == "balance":
+        if not is_logged_in:
+            await query.edit_message_text("⚠️ ဦးစွာ Login လုပ်ပါ။", parse_mode="Markdown")
+            return
+        bal = get_balance()
+        await query.edit_message_text(f"💰 **လက်ကျန်ငွေ:** `{bal}`", parse_mode="Markdown")
+    
+    # ========== SET 5D ==========
+    elif query.data == "set_5d":
+        keyboard = [
+            [InlineKeyboardButton("🔄 ဖွင့်/ပိတ်", callback_data="toggle_5d")],
+            [InlineKeyboardButton("📌 ထိုးပုံစံပြောင်း", callback_data="change_5d_bettype")],
+            [InlineKeyboardButton("🔁 လိုက်ထိုးစနစ် On/Off", callback_data="toggle_follow")],
+            [InlineKeyboardButton("📈 လိုက်ဆပြောင်း", callback_data="change_5d_sequence")],
+            [InlineKeyboardButton("🔙 နောက်သို့", callback_data="back_to_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        follow_status = "✅ On" if game_settings["5d"]["follow"] else "❌ Off"
+        seq = game_settings["5d"]["sequence"]
+        await query.edit_message_text(
+            f"⚙️ **5D သတ်မှတ်ချက်များ**\n\n"
+            f"အခြေအနေ: `{'ဖွင့်ထား' if game_settings['5d']['enabled'] else 'ပိတ်ထား'}`\n"
+            f"ထိုးပုံစံ: `{game_settings['5d']['bet_type']}`\n"
+            f"လိုက်ထိုးစနစ်: `{follow_status}`\n"
+            f"လိုက်ဆ: `{seq}`",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    
+    # ========== TOGGLE ==========
+    elif query.data == "toggle_5d":
+        game_settings["5d"]["enabled"] = not game_settings["5d"]["enabled"]
+        status = "ဖွင့်ထား" if game_settings["5d"]["enabled"] else "ပိတ်ထား"
+        await query.edit_message_text(f"✅ 5D ကို `{status}` ပါ။", parse_mode="Markdown")
+    
+    elif query.data == "toggle_follow":
+        game_settings["5d"]["follow"] = not game_settings["5d"]["follow"]
+        status = "On" if game_settings["5d"]["follow"] else "Off"
+        await query.edit_message_text(f"✅ လိုက်ထိုးစနစ်ကို `{status}` ပါ။", parse_mode="Markdown")
+    
+    # ========== CHANGE BET TYPE ==========
+    elif query.data == "change_5d_bettype":
+        keyboard = [
+            [InlineKeyboardButton("🔴 Even (စုံ)", callback_data="5d_even")],
+            [InlineKeyboardButton("🟡 Odd (မ)", callback_data="5d_odd")],
+            [InlineKeyboardButton("🔵 Big (အကြီး)", callback_data="5d_big")],
+            [InlineKeyboardButton("🟢 Small (အသေး)", callback_data="5d_small")],
+            [InlineKeyboardButton("🔙 နောက်သို့", callback_data="set_5d")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("📌 **5D ထိုးပုံစံရွေးပါ**", reply_markup=reply_markup, parse_mode="Markdown")
+    
+    elif query.data in ["5d_even", "5d_odd", "5d_big", "5d_small"]:
+        bet_type = query.data.replace("5d_", "")
+        game_settings["5d"]["bet_type"] = bet_type
+        await query.edit_message_text(f"✅ 5D ထိုးပုံစံကို `{bet_type}` ပြောင်းပြီးပါပြီ။", parse_mode="Markdown")
+    
+    # ========== CHANGE SEQUENCE ==========
+    elif query.data == "change_5d_sequence":
+        await query.edit_message_text(
+            "📈 **5D လိုက်ဆပြောင်းရန်**\n\n"
+            "ဥပမာ - `/set5dseq 100,300,900,2400,7200,15000,30000`\n\n"
+            "**သတိပြုရန်:** ဂဏန်း 7 လုံးအတိအကျထည့်ပါ။",
+            parse_mode="Markdown"
+        )
+    
+    elif query.data == "change_sequence":
+        await query.edit_message_text(
+            "📈 **လိုက်ဆပြောင်းရန်**\n\n"
+            "`/set5dseq 100,300,900,2400,7200,15000,30000`",
+            parse_mode="Markdown"
+        )
+    
+    # ========== BACK ==========
+    elif query.data == "back_to_menu":
+        await start(update, context)
+    
+    # ========== START 5D ==========
+    elif query.data == "start_5d":
+        if is_running:
+            await query.edit_message_text("⏳ **Bot က ဆော့နေပြီးသားပါ!**", parse_mode="Markdown")
+            return
+        if not is_logged_in:
+            await query.edit_message_text("⚠️ ဦးစွာ Login လုပ်ပါ။", parse_mode="Markdown")
+            return
+        
+        if not game_settings["5d"]["enabled"]:
+            await query.edit_message_text("⚠️ 5D ကို ပိတ်ထားပါတယ်။ ဦးစွာဖွင့်ပါ။", parse_mode="Markdown")
+            return
+        
+        is_running = True
+        is_paused = False
+        total_win = 0
+        total_loss = 0
+        consecutive_losses = 0
+        last_result = None
+        
+        seq = game_settings["5d"]["sequence"]
+        await query.edit_message_text(
+            f"▶️ **5D Auto Betting စတင်ပါပြီ!**\n\n"
+            f"📌 လိုက်ထိုးစနစ်: `{'On' if game_settings['5d']['follow'] else 'Off'}`\n"
+            f"📈 လိုက်ဆ: `{seq}`\n"
+            f"🔄 အိုင်/ကုန်ရင် `{seq[0]}` ကနေ ပြန်စမယ်\n\n"
+            f"ရပ်ချင်ရင် ⏸ ခဏရပ် သို့ ⏹ ရပ်ဆိုင်း နှိပ်ပါ။",
+            parse_mode="Markdown"
+        )
+        
+        await auto_bet_5d()
+    
+    # ========== PAUSE ==========
+    elif query.data == "pause":
+        if not is_running:
+            await query.edit_message_text("⏸ **Bot က မဆော့သေးပါဘူး။**", parse_mode="Markdown")
+            return
+        is_paused = not is_paused
+        status = "ခဏရပ်ထားပါပြီ" if is_paused else "ပြန်ဆော့နေပါပြီ"
+        await query.edit_message_text(f"⏸ **Bot {status}**", parse_mode="Markdown")
+    
+    # ========== STOP ==========
+    elif query.data == "stop":
+        is_running = False
+        is_paused = False
+        await query.edit_message_text("⏹ **Bot ရပ်ဆိုင်းထားပါပြီ။** /start နဲ့ ပြန်စနိုင်ပါတယ်။", parse_mode="Markdown")
+    
+    # ========== STATUS ==========
+    elif query.data == "status":
+        if not is_logged_in:
+            await query.edit_message_text("⚠️ ဦးစွာ Login လုပ်ပါ။", parse_mode="Markdown")
+            return
+        bal = get_balance()
+        seq = game_settings["5d"]["sequence"]
+        status_text = "▶️ ဆော့နေသည်" if is_running and not is_paused else "⏸ ရပ်ထားသည်" if is_paused else "⏹ မဆော့သေးပါ"
+        next_bet = seq[consecutive_losses] if consecutive_losses < len(seq) else seq[0]
+        await query.edit_message_text(
+            f"📊 **5D အခြေအနေ**\n\n"
+            f"🔹 Bot: `{status_text}`\n"
+            f"💰 လက်ကျန်: `{bal}`\n"
+            f"🏆 စုစုပေါင်းအိုင်: `{total_win}`\n"
+            f"❌ စုစုပေါင်းရှုံး: `{total_loss}`\n"
+            f"📉 အရှုံးဆက်: `{consecutive_losses}/{len(seq)}`\n"
+            f"📈 နောက်ထိုးငွေ: `{next_bet}`",
+            parse_mode="Markdown"
+        )
+
+# ============================================
+#  5D AUTO BET LOOP
+# ============================================
+
+async def auto_bet_5d():
+    global is_running, is_paused, total_win, total_loss, consecutive_losses, chat_id, last_result
+    
+    settings = game_settings["5d"]
+    seq = settings["sequence"]
+    game_type = settings["game_type"]
+    bet_type = settings["bet_type"]
+    follow = settings["follow"]
+    
+    first_bet = True
+    
+    while is_running:
+        while is_paused and is_running:
+            time.sleep(2)
+            continue
+        
+        if not is_running:
+            break
+        
+        # ===== လိုက်ဆကုန်ရင် ပြန်စမယ် =====
+        if consecutive_losses >= len(seq):
+            await context.bot.send_message(
+                chat_id,
+                f"🔄 **လိုက်ဆကုန်သွားပါပြီ!**\n"
+                f"ပြန် `{seq[0]}` ကနေ စမယ်။",
+                parse_mode="Markdown"
+            )
+            consecutive_losses = 0
+            continue
+        
+        # ===== နောက်ဆုံးရလဒ်ကိုယူမယ် (ပထမအကြိမ်မဟုတ်ရင်) =====
+        if not first_bet and follow:
+            last_num = get_last_result()
+            if last_num is not None:
+                new_bet_type = get_bet_type_from_number(last_num)
+                if new_bet_type:
+                    bet_type = new_bet_type
+                    await context.bot.send_message(
+                        chat_id,
+                        f"🔁 **လိုက်ထိုးမယ်!**\n"
+                        f"နောက်ဆုံးကျတာက `{last_num}` → `{bet_type}` ကိုလိုက်ထိုးမယ်",
+                        parse_mode="Markdown"
+                    )
+        
+        first_bet = False
+        
+        # ===== လက်ကျန်စစ် =====
+        bal = get_balance()
+        bet_amount = seq[consecutive_losses]
+        
+        if bal < bet_amount:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ **လက်ကျန်မလောက်ပါ!**\n"
+                f"လိုတယ်: `{bet_amount}`, ရှိတယ်: `{bal}`\n"
+                f"Bot ရပ်ဆိုင်းလိုက်ပါပြီ။",
+                parse_mode="Markdown"
+            )
+            is_running = False
+            break
+        
+        # ===== ထီးထိုး =====
+        await context.bot.send_message(
+            chat_id,
+            f"🎯 **ထိုးနေပါပြီ...**\n"
+            f"📌 ထိုးပုံစံ: `{bet_type}`\n"
+            f"💰 ထိုးငွေ: `{bet_amount}`",
+            parse_mode="Markdown"
+        )
+        
+        result = place_bet(game_type, bet_type, bet_amount)
+        
+        # ===== ရလဒ်စစ် =====
+        if result.get("status") == "win":
+            total_win += bet_amount
+            await context.bot.send_message(
+                chat_id,
+                f"🎉 **5D အိုင်!**\n"
+                f"💰 ထိုးငွေ: `{bet_amount}`\n"
+                f"🏆 စုစုပေါင်းအိုင်: `{total_win}`\n"
+                f"🔄 ပြန် `{seq[0]}` ကနေ စမယ်",
+                parse_mode="Markdown"
+            )
+            consecutive_losses = 0  # အိုင်ရင် ပြန်စ
+        else:
+            total_loss += bet_amount
+            consecutive_losses += 1
+            next_bet = seq[consecutive_losses] if consecutive_losses < len(seq) else seq[0]
+            await context.bot.send_message(
+                chat_id,
+                f"😞 **5D ရှုံး!**\n"
+                f"💰 ထိုးငွေ: `{bet_amount}`\n"
+                f"❌ စုစုပေါင်းရှုံး: `{total_loss}`\n"
+                f"📉 အရှုံးဆက်: `{consecutive_losses}/{len(seq)}`\n"
+                f"📈 နောက်ထိုးငွေ: `{next_bet}`",
+                parse_mode="Markdown"
+            )
+        
+        # ===== စောင့်ချိန် (5D က ၁ မိနစ်) =====
+        time.sleep(60)
+
+# ============================================
+#  COMMAND HANDLERS
+# ============================================
+
+async def set_5d_seq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ ခွင့်မပြုပါ!")
+        return
+    try:
+        args = context.args
+        if args:
+            new_seq = [int(x) for x in args[0].split(',')]
+            if len(new_seq) != 7:
+                await update.message.reply_text("❌ လိုက်ဆ ၇ လုံးအတိအကျထည့်ပါ။")
+                return
+            game_settings["5d"]["sequence"] = new_seq
+            await update.message.reply_text(
+                f"✅ 5D လိုက်ဆပြောင်းပြီး: `{new_seq}`\n"
+                f"🔄 အိုင်/ကုန်ရင် `{new_seq[0]}` ကနေ ပြန်စမယ်",
+                parse_mode="Markdown"
+            )
+        else:
+            seq = game_settings["5d"]["sequence"]
+            await update.message.reply_text(f"📈 5D လက်ရှိလိုက်ဆ: `{seq}`", parse_mode="Markdown")
+    except:
+        await update.message.reply_text(
+            "❌ ပုံစံမှားပါတယ်။\n"
+            "ဥပမာ: `/set5dseq 100,300,900,2400,7200,15000,30000`",
+            parse_mode="Markdown"
+        )
+
+# ============================================
+#  MAIN
+# ============================================
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("set5dseq", set_5d_seq))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    print("🤖 5D Bot is running on Railway...")
+    print(f"📈 5D Sequence: {game_settings['5d']['sequence']}")
+    print(f"🔁 Follow Mode: {game_settings['5d']['follow']}")
+    
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
